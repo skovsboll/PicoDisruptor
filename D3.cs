@@ -44,6 +44,7 @@ namespace PicoFx.D3 {
 
 	class Writer<T> : IObserver<T>, IDisposable {
 		private readonly D3<T> _disruptor;
+
 		public readonly Head Current = new Head();
 
 		public Writer( D3<T> disruptor ) {
