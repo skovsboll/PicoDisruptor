@@ -1,12 +1,20 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics.Contracts;
 using System.Linq;
 using System.Reactive.Disposables;
+using System.Reactive.Linq;
+using System.Reactive.Subjects;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Xunit.Sdk;
 
 namespace PicoFx.Disruptor {
+
+	/// <summary>
+	/// RINGBUFFER
+	/// </summary>
 
 	public class RingBuffer<T> {
 		private readonly ulong _sizeMinusOne;
@@ -35,24 +43,25 @@ namespace PicoFx.Disruptor {
 			}
 		}
 
+		public IEnumerable<T> Slice( long start, long end ) {
+			for ( long i = start; i <= end; i++ )
+				yield return this[ i ];
+		}
+
 		private long IndexToSlot( long index ) {
 			return (long)( (ulong)index & _sizeMinusOne );
 		}
-
-		public IEnumerable<T> Slice( long start, long end ) {
-			for ( long i = start; i <= end; i++ ) {
-				yield return this[ i ];
-			}
-		}
 	}
+
+	/// <summary>
+	/// WAITSTRATEGY
+	/// </summary>
 
 	public interface WaitStrategy {
 		void WaitFor( Func<bool> condition );
 	}
 
 	public class ThreadYieldWaitStrategy : WaitStrategy {
-		#region WaitStrategy Members
-
 		public void WaitFor( Func<bool> condition ) {
 			while ( !condition() ) {
 				bool otherThreadsAvailable = Thread.Yield(); // Yield to other processes on same CPU
@@ -61,95 +70,60 @@ namespace PicoFx.Disruptor {
 				}
 			}
 		}
-
-		#endregion
 	}
 
-	public class Disruptor<T> {
+	/// <summary>
+	/// DISRUPTOR
+	/// </summary>
+
+	public class Disruptor<T> : IObservable<IEnumerable<T>>, IDisposable {
 		private readonly RingBuffer<T> _buffer;
 
-		private readonly IDictionary<int, ConsumingWorker> _consumers = new Dictionary<int, ConsumingWorker>();
-		private readonly BufferRange _bufferRange;
-		private readonly IDictionary<int, ProducingWorker> _producers = new Dictionary<int, ProducingWorker>();
+		private readonly HeadOfBuffer _headOfBuffer;
+		private readonly ConcurrentDictionary<int, ConsumingWorker> _consumers = new ConcurrentDictionary<int, ConsumingWorker>();
+		private readonly ConcurrentDictionary<int, ProducingWorker> _producers = new ConcurrentDictionary<int, ProducingWorker>();
 
 		private readonly WaitStrategy _waitStrategy;
-		private bool _aborting;
-		private ConsumingWorker _cleaner;
-		private int _cleanerManagedId;
-		static object Door = new object();
 
 		public Disruptor( int size ) : this( size, new ThreadYieldWaitStrategy() ) { }
 
 		public Disruptor( int size, WaitStrategy waitStrategy ) {
 			_waitStrategy = waitStrategy;
 			_buffer = new RingBuffer<T>( size );
-			_bufferRange = new BufferRange( _buffer.Size );
+			_headOfBuffer = new HeadOfBuffer( _buffer.Size );
 		}
 
 		public Disruptor( WaitStrategy waitStrategy, RingBuffer<T> ringBuffer ) {
 			_waitStrategy = waitStrategy;
 			_buffer = ringBuffer;
-			_bufferRange = new BufferRange( _buffer.Size );
-		}
-
-		public IObservable<T> Cleaning {
-			get { return new ConsumerHotObservable<T>( CleanNextBatch, Commit ); }
-		}
-
-		public IObservable<T> Consuming {
-			get { return new ConsumerHotObservable<T>( ConsumeNextBatch, Commit ); }
-		}
-
-		private bool AllPartiesRegistered {
-			get { return _cleaner != null && _producers.Count > 0; }
+			_headOfBuffer = new HeadOfBuffer( _buffer.Size );
 		}
 
 		public void Put( T value ) {
-			ProducingWorker producer = RegisterProducer();
-
-			_waitStrategy.WaitFor( () => _aborting || ( AllPartiesRegistered ) );
-
-			if ( _aborting ) {
-				return;
-			}
-
+			ProducingWorker producer = _producers[ Thread.CurrentThread.ManagedThreadId ];
 			producer.AcquireNext();
-
-			_buffer[ producer.WorkingPosition ] = value;
+			_buffer[ producer.Position.WorkingPosition ] = value;
 		}
 
 		public void Put( IEnumerable<T> values ) {
-			ProducingWorker producer = RegisterProducer();
-			_waitStrategy.WaitFor( () => AllPartiesRegistered );
-
+			ProducingWorker producer = _producers[ Thread.CurrentThread.ManagedThreadId ];
 			foreach ( T value in values ) {
 				producer.AcquireNext();
-				_buffer[ producer.WorkingPosition ] = value;
+				_buffer[ producer.Position.WorkingPosition ] = value;
 			}
 		}
 
-		public IEnumerable<T> ConsumeNextBatch() {
-			Contract.Ensures( Contract.Result<IEnumerable<T>>() != null );
+		internal IEnumerable<T> ConsumeNextBatch() {
+			ConsumingWorker consumer = _consumers[ Thread.CurrentThread.ManagedThreadId ];
 
-			ConsumingWorker consumer = RegisterConsumer();
-			_waitStrategy.WaitFor( () => AllPartiesRegistered && ReadyToConsume( consumer ) );
+			_waitStrategy.WaitFor( () => ReadyToConsume( consumer ) || !_producers.Any() );
 
-			consumer.CatchUpWith( _producers.Values.OrderByDescending( p => p.CommittedPosition ).First() );
+			if ( ReadyToConsume( consumer ) ) {
+				consumer.CatchUpWith( _headOfBuffer.Position.CommittedPosition );
+				return _buffer.Slice( consumer.Position.CommittedPosition + 1, consumer.Position.WorkingPosition );
+			}
 
-			return _buffer.Slice( consumer.CommittedPosition + 1, consumer.WorkingPosition );
-		}
-
-		public IEnumerable<T> CleanNextBatch() {
-			Contract.Ensures( Contract.Result<IEnumerable<T>>() != null );
-
-			ConsumingWorker cleaner = RegisterCleaner();
-			_waitStrategy.WaitFor( () => AllPartiesRegistered && ReadyToClean() );
-
-			cleaner.CatchUpWith( _consumers.Any()
-							? (Worker)_consumers.Values.OrderBy( c => c.CommittedPosition ).First()
-							: _producers.Values.OrderByDescending( c => c.CommittedPosition ).First() );
-
-			return _buffer.Slice( cleaner.CommittedPosition + 1, cleaner.WorkingPosition );
+			return null;
 		}
 
 		public void Commit() {
@@ -157,32 +131,12 @@ namespace PicoFx.Disruptor {
 			worker.Commit();
 		}
 
-		public void Stop() {
-			_aborting = true;
-		}
-
-		//private bool ReadyToProduce() {
-		//      return _producers.Values.All( p => p.WorkingPosition - _cleaner.CommittedPosition < _buffer.Size );
-		//}
-
 		private bool ReadyToConsume( Worker consumer ) {
-			return _producers.Values.Any( p => p.CommittedPosition > consumer.WorkingPosition );
-		}
-
-		private bool ReadyToClean() {
-			if ( _consumers.Count > 0 ) {
-				return _consumers.Values.All( r => r.CommittedPosition > _cleaner.WorkingPosition );
-			}
-			else {
-				return _producers.Values.Any( p => p.CommittedPosition > _cleaner.WorkingPosition );
-			}
+			return _headOfBuffer.Position.CommittedPosition > consumer.Position.WorkingPosition;
 		}
 
 		private Worker GetCurrentWorker() {
 			int threadId = Thread.CurrentThread.ManagedThreadId;
-			if ( _cleanerManagedId == threadId ) {
-				return _cleaner;
-			}
 
 			if ( _producers.ContainsKey( threadId ) ) {
 				return _producers[ threadId ];
@@ -195,62 +149,98 @@ namespace PicoFx.Disruptor {
 			throw new IndexOutOfRangeException( "Unknown worker" );
 		}
 
-		private ProducingWorker RegisterProducer() {
+		[ContractInvariantMethod]
+		private void ClassInvariants() {
+			//Contract.Invariant( !_cleaners.Any() || _producers.Values.All( p => FindTail().CommittedPosition - p.CommittedPosition < _buffer.Size ), "A producer is exceeding the ringbuffer capacity." );
+			//Contract.Invariant( _producers.ToArray().Count( p => p.Value.WorkingPosition > p.Value.CommittedPosition ) <= 1, "Only one producer can be producing at any given time." );
+			Contract.Invariant( _producers.Keys.Union( _consumers.Keys ).Distinct().Count() == _producers.Count + _consumers.Count, "The same thread registered in multiple roles." );
+		}
+
+		public IDisposable Subscribe( IObserver<IEnumerable<T>> batchObserver ) {
+			return new DisruptorSubscription<T>( batchObserver, this, Role.Consumer );
+		}
+
+		public IDisposable RegisterThread( Role role ) {
 			int threadId = Thread.CurrentThread.ManagedThreadId;
-			if ( !_producers.ContainsKey( threadId ) ) {
-				var producer = new ThreadSafeProducer( _waitStrategy, _bufferRange );
-				lock ( Door ) {
-					_producers.Add( threadId, producer );
+			switch ( role ) {
+				case Role.Producer:
+					var threadSafeProducer = new ThreadSafeProducer<T>( _waitStrategy, _headOfBuffer, FindTail );
+					_producers.TryAdd( threadId, threadSafeProducer );
+					return Disposable.Create( () => {
+						ProducingWorker worker;
+						if ( !_producers.TryRemove( threadId, out worker ) )
+							throw new DoesNotContainException( threadSafeProducer );
+					} );
+
+				case Role.Consumer:
+					var consumer = new Consumer();
+					_consumers.TryAdd( threadId, consumer );
+					return Disposable.Create( () => {
+						ConsumingWorker worker;
+						if ( !_consumers.TryRemove( threadId, out worker ) )
+							throw new DoesNotContainException( consumer );
+					} );
+
+				default:
+					throw new ArgumentOutOfRangeException( "Unknown role " + role );
+			}
+		}
+
+		public void Dispose() {
+			_producers.Clear();
+			// Give consumers a chance to consume the last items.
+		}
+
+		private long FindTail() {
+			return _consumers.Values.Select( w => w.Position.CommittedPosition ).DefaultIfEmpty( -1 ).Min();
+		}
+	}
+
+	/// <summary>
+	/// SUBSCRIPTION
+	/// </summary>
+
+	public class DisruptorSubscription<T> : IDisposable {
+		private bool _stopping;
+
+		public DisruptorSubscription( IObserver<IEnumerable<T>> observer, Disruptor<T> disruptor, Role role ) {
+			using ( disruptor.RegisterThread( role ) ) {
+				while ( !_stopping ) {
+					try {
+						IEnumerable<T> batch = disruptor.ConsumeNextBatch();
+						if ( batch != null )
+							observer.OnNext( batch );
+						else
+							_stopping = true;
+					}
+					catch ( Exception exception ) {
+						observer.OnError( exception );
+					}
+					finally {
+						disruptor.Commit();
+					}
 				}
-				return producer;
+				observer.OnCompleted();
 			}
-
-			return _producers[ threadId ];
 		}
-
-		private ConsumingWorker RegisterConsumer() {
-			int threadId = Thread.CurrentThread.ManagedThreadId;
-			if ( !_consumers.ContainsKey( threadId ) ) {
-				var consumer = new Consumer();
-				lock ( Door ) {
-					_consumers.Add( threadId, consumer );
-				}
-				return consumer;
-			}
-			return _consumers[ threadId ];
+		public void Dispose() {
+			_stopping = true;
 		}
+	}
 
-		private ConsumingWorker RegisterCleaner() {
-			int threadId = Thread.CurrentThread.ManagedThreadId;
-			if ( _cleaner == null ) {
-				_cleaner = new Cleaner( _bufferRange );
-				_cleanerManagedId = threadId;
-			}
-			else if ( _cleanerManagedId != threadId ) {
-				throw new InvalidOperationException( "A Cleaner is already registered. Only one allowed." );
-			}
 
-			return _cleaner;
-		}
-
-		//[ContractInvariantMethod]
-		//private void ClassInvariants() {
-		//      Contract.Invariant( _cleaner == null ||
-		//                         _producers.Values.All( p => _cleaner.CommittedPosition - p.CommittedPosition < _buffer.Size ),
-		//                         "A producer is exceeding the ringbuffer capacity." );
-
-		//      //Contract.Invariant(_producers.ToArray().Count(p => p.WorkingPosition > p.CommittedPosition) <= 1, "Only one producer can be producing at any given time.");
-		//}
+	public enum Role {
+		Producer,
+		Consumer,
 	}
 
 	public interface Worker {
-		long CommittedPosition { get; }
-		long WorkingPosition { get; }
+		CachePaddedPosition Position { get; }
 		void Commit();
 	}
 
 	public interface ConsumingWorker : Worker {
-		void CatchUpWith( Worker other );
+		void CatchUpWith( long committedPosition );
 	}
 
 	public interface ProducingWorker : Worker {
@@ -266,161 +256,82 @@ namespace PicoFx.Disruptor {
 		public long CommittedPosition;
 	}
 
-	public class BufferRange {
-		public BufferRange( int bufferSize ) {
+	public class HeadOfBuffer {
+		public HeadOfBuffer( int bufferSize ) {
 			BufferSize = bufferSize;
-			Head.CommittedPosition = Head.WorkingPosition = -1;
-			Tail.CommittedPosition = Tail.WorkingPosition = -1;
+			Position.CommittedPosition = Position.WorkingPosition = -1;
 		}
-		public CachePaddedPosition Head;
-		public CachePaddedPosition Tail;
-		public int BufferSize;
+		public CachePaddedPosition Position;
+		public readonly int BufferSize;
 	}
+
+	/// <summary>
+	/// CONSUMER
+	/// </summary>
 
 	public class Consumer : ConsumingWorker {
-		private long _committedPosition;
-		private long _workingPosition;
+		private CachePaddedPosition _position;
 
 		public Consumer() {
-			_committedPosition = _workingPosition = -1;
+			_position.CommittedPosition = _position.WorkingPosition = -1;
 		}
 
-		#region ConsumingWorker Members
-
-		public long CommittedPosition {
-			get { return _committedPosition; }
-		}
-
-		public long WorkingPosition {
-			get { return _workingPosition; }
+		public CachePaddedPosition Position {
+			get { return _position; }
 		}
 
 		public void Commit() {
-			_committedPosition = _workingPosition;
+			_position.CommittedPosition = _position.WorkingPosition;
 		}
 
-		public void CatchUpWith( Worker other ) {
-			_workingPosition = other.CommittedPosition;
+		public void CatchUpWith( long committedPosition ) {
+			_position.WorkingPosition = committedPosition;
 		}
-
-		#endregion
 	}
 
-	public class Cleaner : ConsumingWorker {
-		private long _committedPosition;
-		private long _workingPosition;
-		private BufferRange _bufferRange;
 
-		public Cleaner( BufferRange bufferRange ) {
-			_bufferRange = bufferRange;
-			_committedPosition = _workingPosition = -1;
-		}
+	/// <summary>
+	/// PRODUCER
+	/// </summary>
 
-		#region ConsumingWorker Members
-
-		public long CommittedPosition {
-			get { return _committedPosition; }
-		}
-
-		public long WorkingPosition {
-			get { return _workingPosition; }
-		}
-
-		public void Commit() {
-			_committedPosition = _workingPosition;
-			_bufferRange.Tail.CommittedPosition = _workingPosition;
-		}
-
-		public void CatchUpWith( Worker other ) {
-			_workingPosition = other.CommittedPosition;
-			_bufferRange.Tail.WorkingPosition = _workingPosition;
-		}
-
-		#endregion
-	}
-
-	public class ThreadSafeProducer : ProducingWorker {
-		private readonly BufferRange _head;
+	public class ThreadSafeProducer<T> : ProducingWorker {
+		private readonly HeadOfBuffer _head;
 		private readonly WaitStrategy _waitStrategy;
-		private long _committedPosition;
-		private long _workingPosition;
+		private readonly Func<long> _findTail;
+		private CachePaddedPosition _position;
 
-		public ThreadSafeProducer( WaitStrategy waitStrategy, BufferRange head ) {
+		public ThreadSafeProducer( WaitStrategy waitStrategy, HeadOfBuffer head, Func<long> findTail ) {
+			_findTail = findTail;
 			_head = head;
 			_waitStrategy = waitStrategy;
+			_position.WorkingPosition = _position.CommittedPosition = -1;
 		}
 
-		#region ProducingWorker Members
-
-		public long CommittedPosition {
-			get { return _committedPosition; }
-		}
-
-		public long WorkingPosition {
-			get { return _workingPosition; }
+		public CachePaddedPosition Position {
+			get { return _position; }
 		}
 
 		public void AcquireNext() {
 			long original, changed;
 			do {
 				_waitStrategy.WaitFor( ReadyToAcquire );
-				original = _head.Head.WorkingPosition;
+				original = _head.Position.WorkingPosition;
 				changed = original + 1;
-			} while ( original != Interlocked.CompareExchange( ref _head.Head.WorkingPosition, changed, original ) );
-			_workingPosition = changed;
+			} while ( original != Interlocked.CompareExchange( ref _head.Position.WorkingPosition, changed, original ) );
+			_position.WorkingPosition = changed;
 		}
 
 		public void Commit() {
-			_committedPosition = _workingPosition;
-			_head.Head.CommittedPosition = _committedPosition;
+			_position.CommittedPosition = _position.WorkingPosition;
+			_head.Position.CommittedPosition = _position.CommittedPosition;
 		}
-
-		#endregion
 
 		private bool ReadyToAcquire() {
-			bool headIsFree = _head.Head.WorkingPosition == _head.Head.CommittedPosition;
-			bool iOwnTheHead = _head.Head.WorkingPosition == _workingPosition;
-			bool noWrappingWillOccur = _head.Head.WorkingPosition - _head.Tail.CommittedPosition < _head.BufferSize;
+			bool headIsFree = _head.Position.WorkingPosition == _head.Position.CommittedPosition;
+			bool iOwnTheHead = _head.Position.WorkingPosition == _position.WorkingPosition;
+			long tail = _findTail();
+			bool noWrappingWillOccur = _head.Position.WorkingPosition - tail < _head.BufferSize;
 			return noWrappingWillOccur && ( headIsFree || iOwnTheHead );
-		}
-	}
-
-	public static class IntExtensions {
-		public static IEnumerable<int> To( this int start, int end ) {
-			for ( int i = start; i <= end; i++ ) {
-				yield return i;
-			}
-		}
-	}
-
-	internal class ConsumerHotObservable<T> : IObservable<T> {
-		private readonly Func<IEnumerable<T>> _batchFetcher;
-		private readonly Action _committer;
-		private bool _aborting;
-
-		public ConsumerHotObservable( Func<IEnumerable<T>> batchFetcher, Action committer ) {
-			_committer = committer;
-			_batchFetcher = batchFetcher;
-		}
-
-		public IDisposable Subscribe( IObserver<T> observer ) {
-			while ( !_aborting ) {
-				try {
-					IEnumerable<T> batch = _batchFetcher();
-
-					if ( _aborting ) break;
-
-					foreach ( T item in batch ) {
-						observer.OnNext( item );
-					}
-					_committer();
-				}
-				catch ( Exception e ) {
-					observer.OnError( e );
-				}
-			}
-			observer.OnCompleted();
-			return Disposable.Create( () => _aborting = true );
 		}
 	}
 }

@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Reactive.Concurrency;
@@ -11,48 +12,111 @@ using Xunit;
 namespace PicoFx.Disruptor {
 
 	// ReSharper disable InconsistentNaming
-	public class RingBufferTests {
+	public class DisruptorTests {
 		//readonly WaitStrategy _waitStrategy = new SpinWaitStrategy();
-		readonly WaitStrategy _waitStrategy = new ThreadYieldWaitStrategy();
+		private readonly WaitStrategy _waitStrategy = new ThreadYieldWaitStrategy();
 
-		public RingBufferTests() {
+		public DisruptorTests() {
 			Trace.Listeners.Add( new DefaultTraceListener() );
 		}
 
 		[Fact]
-		public void DisruptorCanMakeConsumersWaitForProducers() {
+		public void Disruptor_Refuses_To_Produce_When_Thread_Is_Not_Registered() {
+			// Arrange
+			var sut = new Disruptor<int>( 16, _waitStrategy );
+
+			// Act + Assert
+			Assert.Throws<KeyNotFoundException>( () => {
+				sut.Put( Enumerable.Range( 10, 20 ) );
+				sut.Commit();
+			} );
+		}
+		
+		[Fact]
+		public void Disruptor_Allows_Producing_When_Thread_Is_Registered() {
+			// Arrange
+			var sut = new Disruptor<int>( 16, _waitStrategy );
+			using ( sut.RegisterThread( Role.Producer ) ) {
+
+				// Act
+				sut.Put( Enumerable.Range( 10, 20 ) );
+				sut.Commit();
+			}
+
+			// Assert
+			// No exception
+		}
+
+		[Fact]
+		public void Subscription_Ends_When_All_Producers_Finish_And_No_More_Items_Are_Available() {
+			// Arrange
+			bool[] completed = new bool[ 1 ];
+			Exception[] errors = new Exception[ 1 ];
+			long[] count = new long[ 1 ];
+
+			var sut = new Disruptor<int>( 16, _waitStrategy );
+			using ( sut.RegisterThread( Role.Producer ) ) {
+				sut.SubscribeOn( Scheduler.NewThread ).Subscribe(
+					batch => count[ 0 ] += batch.Count(),
+					e => errors[ 0 ] = e,
+					() => completed[ 0 ] = true
+					);
+				// Act
+
+				sut.Put( Enumerable.Range( 0, 3 ) );
+				sut.Commit();
+			}
+
+			Thread.Sleep( 100 );
+
+			// Assert
+			Assert.Null( errors[ 0 ] );
+			Assert.Equal( 3, count[ 0 ] );
+			Assert.True( completed[ 0 ] );
+		}
+
+
+
+		[Fact]
+		public void Disruptor_Can_Make_Consumers_Wait_For_Producers() {
 			var sut = new Disruptor<int>( 16, _waitStrategy );
 			int[] counters = new int[ 2 ];
 
 			var t1 = new Thread( () => {
-				Thread.Sleep( 100 );
+				using ( sut.RegisterThread( Role.Producer ) ) {
+					Thread.Sleep( 50 );
+					sut.Put( 9 );
+					sut.Put( 12 );
 
-				sut.Put( 9 );
-				Thread.Sleep( 5 );
-				sut.Put( 12 );
-				sut.Commit();
-				sut.Stop();
+					Thread.Sleep( 50 );
+					sut.Commit();
+
+					Thread.Sleep( 50 );
+				}
+				sut.Dispose();
+
 			} ) { Name = "Producer" };
 
 			var t2 = new Thread( () => {
-				Thread.Sleep( 50 );
+				using ( sut.RegisterThread( Role.Consumer ) ) {
 
-				var batch = sut.ConsumeNextBatch();
-				counters[ 0 ] += batch.Count();
-				sut.Commit();
-
+					var batch = sut.ConsumeNextBatch();
+					counters[ 0 ] += batch.Count();
+					sut.Commit();
+				}
 			} ) { Name = "Consumer" };
 
 			var t3 = new Thread( () => {
-				Thread.Sleep( 20 );
+				using ( sut.RegisterThread( Role.Consumer ) ) {
 
-				var batch = sut.CleanNextBatch();
-				counters[ 1 ] += batch.Count();
-				sut.Commit();
-
+					var batch = sut.ConsumeNextBatch();
+					counters[ 1 ] += batch.Count();
+					sut.Commit();
+				}
 			} ) { Name = "Cleaner" };
 
 			t1.Start();
+			Thread.Sleep( 20 );
 			t2.Start();
 			t3.Start();
 
@@ -60,8 +124,8 @@ namespace PicoFx.Disruptor {
 			t2.Join();
 			t3.Join();
 
-			Assert.Equal(2, counters[0]);
-			Assert.Equal(2, counters[1]);
+			Assert.Equal( 2, counters[ 0 ] );
+			Assert.Equal( 2, counters[ 1 ] );
 		}
 
 		[Fact]
@@ -88,18 +152,19 @@ namespace PicoFx.Disruptor {
 
 			var cleanerThread = new Thread( () => {
 				int count = 0;
-
-				while ( count < NumMessagesToproduce ) {
-					var batch = sut.CleanNextBatch();
-					int size = batch.Count();
-					count += size;
-					sut.Commit();
+				using ( sut.RegisterThread( Role.Consumer ) ) {
+					while ( count < NumMessagesToproduce ) {
+						var batch = sut.ConsumeNextBatch();
+						int size = batch.Count();
+						count += size;
+						sut.Commit();
+					}
 				}
-				sut.Stop();
 			} ) { Name = "Cleaner" };
 
 			var stopwatch = new Stopwatch();
 			stopwatch.Start();
+
 			threads.Each( t => t.Start() );
 			cleanerThread.Start();
 
@@ -110,25 +175,40 @@ namespace PicoFx.Disruptor {
 
 			double tps = 6000000 / stopwatch.Elapsed.TotalSeconds;
 			Trace.WriteLine( string.Format( "~{0:0} TPS", tps ) );
+			Assert.True( buffer.AllPositionsWereSetOnlyOnce() );
+			Assert.False( buffer.SequenceContainsHoles() );
 			Assert.True( tps > 1500000, "Running waaayy too slowly." );
-			buffer.CheckAssumptions();
 		}
 
 		private static Thread CreateFastWorker( Disruptor<int> sut, string name, int numberOfBatches, int batchSize ) {
 			return new Thread( () => {
-				for ( int i = 0; i < numberOfBatches; i++ ) {
-					try { sut.Put( 0.To( batchSize - 1 ) ); }
-					finally { sut.Commit(); } // don't block any other workers
+				using ( sut.RegisterThread( Role.Producer ) ) {
+
+					for ( int i = 0; i < numberOfBatches; i++ ) {
+						try {
+							sut.Put( Enumerable.Range( 0, batchSize ) );
+						}
+						finally {
+							sut.Commit();
+						} // don't block any other workers
+					}
 				}
 			} ) { Name = name };
 		}
 
 		private static Thread CreateSlowWorker( Disruptor<int> sut, string name, int numberOfBatches, int batchSize ) {
 			return new Thread( () => {
-				for ( int i = 0; i < numberOfBatches; i++ ) {
-					for ( int j = 0; j < batchSize; j++ ) {
-						try { sut.Put( j ); }
-						finally { sut.Commit(); } // don't block any other workers
+				using ( sut.RegisterThread( Role.Producer ) ) {
+
+					for ( int i = 0; i < numberOfBatches; i++ ) {
+						for ( int j = 0; j < batchSize; j++ ) {
+							try {
+								sut.Put( j );
+							}
+							finally {
+								sut.Commit();
+							} // don't block any other workers
+						}
 					}
 				}
 			} ) { Name = name };
@@ -141,32 +221,40 @@ namespace PicoFx.Disruptor {
 			const int batchSize = 1000;
 
 			var t1 = new Thread( () => {
-				for ( int i = 0; i < numBatches; i++ ) {
-					sut.Put( 0.To( batchSize - 1 ) );
-					sut.Commit();
+				using ( sut.RegisterThread( Role.Producer ) ) {
+
+					for ( int i = 0; i < numBatches; i++ ) {
+						sut.Put(Enumerable.Range(0, batchSize));
+						sut.Commit();
+					}
 				}
+
 			} ) { Name = "Producer" };
 
 			var t2 = new Thread( () => {
 				int count = 0;
+				using ( sut.RegisterThread( Role.Consumer ) ) {
 
-				while ( count < numBatches * batchSize ) {
-					var batch = sut.ConsumeNextBatch();
-					int currentBatchSize = batch.Count();
-					count += currentBatchSize;
-					sut.Commit();
+					while ( count < numBatches * batchSize ) {
+						var batch = sut.ConsumeNextBatch();
+						int currentBatchSize = batch.Count();
+						count += currentBatchSize;
+						sut.Commit();
+					}
 				}
 			} ) { Name = "Consumer" };
 
 			var t3 = new Thread( () => {
 				int count = 0;
+				using ( sut.RegisterThread( Role.Consumer ) ) {
 
-				while ( count < numBatches * batchSize ) {
-					var batch = sut.CleanNextBatch();
-					int currentBatchSize = batch.Count();
-					count += currentBatchSize;
-					//Trace.WriteLine("Cleaner: " + batchSize + " items");
-					sut.Commit();
+					while ( count < numBatches * batchSize ) {
+						var batch = sut.ConsumeNextBatch();
+						int currentBatchSize = batch.Count();
+						count += currentBatchSize;
+						//Trace.WriteLine("Cleaner: " + batchSize + " items");
+						sut.Commit();
+					}
 				}
 			} ) { Name = "Cleaner" };
 
@@ -186,7 +274,13 @@ namespace PicoFx.Disruptor {
 			Trace.WriteLine( string.Format( "~{0:0} TPS", tps ) );
 			Assert.True( tps > 1500000, "Running waaayy too slowly." );
 		}
+	}
 
+	public class RingbufferTests {
+
+		public RingbufferTests() {
+			Trace.Listeners.Add( new DefaultTraceListener() );
+		}
 		[Fact]
 		public void RingBufferSizeSnapsToPowerOfTwo() {
 			// Arrange
@@ -223,26 +317,6 @@ namespace PicoFx.Disruptor {
 
 			Assert.Equal( 9384, sut[ 1 ] );
 		}
-
-		[Fact]
-		public void ConsumerHotObservableCommitsAfterEachBatch() {
-			// Arrange
-			bool[] committed = new bool[ 1 ];
-			int[] count = new int[ 1 ];
-
-			var sut = new ConsumerHotObservable<int>( () => Enumerable.Range( 10, 20 ), () => committed[ 0 ] = true );
-
-			// Act
-			IDisposable subscription = sut.SubscribeOn( Scheduler.NewThread ).Subscribe( i => count[ 0 ]++ );
-
-			Thread.Sleep( 10 );
-			subscription.Dispose();
-
-			// Assert
-			Assert.True( committed[ 0 ] );
-			Assert.True( count[ 0 ] >= 20 );
-		}
-
 	}
 	// ReSharper restore InconsistentNaming
 
@@ -261,15 +335,22 @@ namespace PicoFx.Disruptor {
 			}
 		}
 
-		public void CheckAssumptions() {
-			// No two producers are setting the same value
-			Assert.True( positionsSetCount.All( p => p < 2 ) );
-
-			// No holes in the sequence
-			for ( int i = 0; i < positionsSetCount.Length; i++ ) {
-				if ( i > 0 && positionsSetCount[ i ] > 0 )
-					Assert.True( positionsSetCount[ i - 1 ] > 0 );
+		public bool SequenceContainsHoles() {
+			for(int i = 0; i < positionsSetCount.Length; i++) {
+				if(i > 0 && positionsSetCount[i] > 0) {
+					if ( positionsSetCount[ i - 1 ] == 0 )
+						return true;
+				}
 			}
+			return false;
+		}
+
+		public bool AllPositionsWereSetOnlyOnce() {
+			return positionsSetCount.All( p => p < 2 );
+		}
+
+		public int GetFilledPositionsCount() {
+			return positionsSetCount.Count(s => s > 0);
 		}
 	}
 }
